@@ -1,6 +1,7 @@
 use crate::domain::{AccountEvent, Event};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use std::collections::HashMap;
@@ -17,8 +18,8 @@ pub struct EventStore {
     batch_sender: mpsc::UnboundedSender<BatchedEvent>,
     snapshot_cache: Arc<RwLock<HashMap<Uuid, CachedSnapshot>>>,
     config: EventStoreConfig,
+    // Add semaphore for backpressure control
     batch_semaphore: Arc<Semaphore>,
-    // Metrics for monitoring
     metrics: Arc<EventStoreMetrics>,
 }
 
@@ -31,7 +32,6 @@ struct BatchedEvent {
     created_at: Instant,
     priority: EventPriority,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum EventPriority {
     Low = 0,
@@ -39,17 +39,16 @@ enum EventPriority {
     High = 2,
     Critical = 3,
 }
-
 #[derive(Debug, Clone)]
 struct CachedSnapshot {
     aggregate_id: Uuid,
     data: serde_json::Value,
     version: i64,
     created_at: Instant,
+    // Add TTL for cache invalidation
     ttl: Duration,
 }
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct EventStoreMetrics {
     pub events_processed: AtomicU64,
     pub events_failed: AtomicU64,
@@ -59,7 +58,21 @@ pub struct EventStoreMetrics {
     pub cache_misses: AtomicU64,
 }
 
+impl EventStoreMetrics {
+    pub fn new() -> Self {
+        Self {
+            events_processed: AtomicU64::new(0),
+            events_failed: AtomicU64::new(0),
+            batch_count: AtomicU64::new(0),
+            avg_batch_size: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+        }
+    }
+}
+
 impl EventStore {
+    /// Create EventStore with an existing PgPool
     pub fn new(pool: PgPool) -> Self {
         Self::new_with_config_and_pool(pool, EventStoreConfig::default())
     }
@@ -107,7 +120,7 @@ impl EventStore {
 
         store
     }
-
+    /// Create EventStore with a specific pool size
     pub async fn new_with_config(config: EventStoreConfig) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -163,7 +176,7 @@ impl EventStore {
             .await
             .context("Failed to receive response from batch processor")?
     }
-
+    // Enhanced event saving with backpressure control
     pub async fn save_events(
         &self,
         aggregate_id: Uuid,
@@ -286,7 +299,6 @@ impl EventStore {
             }
         }
     }
-
     // Optimized batch flushing with prepared statements and COPY
     async fn flush_batch(pool: &PgPool, mut batch: Vec<BatchedEvent>) -> Result<()> {
         if batch.is_empty() {
@@ -356,7 +368,6 @@ impl EventStore {
 
         Ok(())
     }
-
     // Pre-calculate event data to reduce serialization overhead
     fn prepare_events_for_insert_optimized(batched_event: &BatchedEvent) -> Result<Vec<EventData>> {
         let mut event_data = Vec::with_capacity(batched_event.events.len());
@@ -402,12 +413,12 @@ impl EventStore {
         if !aggregates.is_empty() {
             let aggregate_ids: Vec<Uuid> = aggregates.keys().copied().collect();
             let current_versions = sqlx::query(
-                "SELECT aggregate_id, MAX(version) as max_version FROM events WHERE aggregate_id = ANY($1) GROUP BY aggregate_id"
-            )
-            .bind(&aggregate_ids)
-            .fetch_all(&mut **tx)
-            .await
-            .context("Failed to check current versions")?;
+            "SELECT aggregate_id, MAX(version) as max_version FROM events WHERE aggregate_id = ANY($1) GROUP BY aggregate_id"
+        )
+        .bind(&aggregate_ids)
+        .fetch_all(&mut **tx)
+        .await
+        .context("Failed to check current versions")?;
 
             for row in current_versions {
                 let aggregate_id: Uuid = row.get("aggregate_id");
@@ -429,11 +440,11 @@ impl EventStore {
 
         // Use COPY for bulk insert - Fixed CSV formatting
         let mut copy_writer = tx
-            .copy_in_raw(
-                "COPY events (id, aggregate_id, event_type, event_data, version, timestamp) FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\"')"
-            )
-            .await
-            .context("Failed to start COPY operation")?;
+        .copy_in_raw(
+            "COPY events (id, aggregate_id, event_type, event_data, version, timestamp) FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\"')"
+        )
+        .await
+        .context("Failed to start COPY operation")?;
 
         for event in event_data {
             // Properly escape CSV values
@@ -481,24 +492,25 @@ impl EventStore {
         let timestamps: Vec<DateTime<Utc>> = event_data.iter().map(|e| e.timestamp).collect();
 
         sqlx::query!(
-            r#"
-            INSERT INTO events (id, aggregate_id, event_type, event_data, version, timestamp)
-            SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::bigint[], $6::timestamptz[])
-            "#,
-            &ids,
-            &aggregate_ids,
-            &event_types,
-            &event_jsons as &[Value],
-            &versions,
-            &timestamps
-        )
-        .execute(&mut **tx)
-        .await
-        .context("Failed to insert events")?;
+        r#"
+        INSERT INTO events (id, aggregate_id, event_type, event_data, version, timestamp)
+        SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::bigint[], $6::timestamptz[])
+        "#,
+        &ids,
+        &aggregate_ids,
+        &event_types,
+        &event_jsons as &[Value],
+        &versions,
+        &timestamps
+    )
+    .execute(&mut **tx)
+    .await
+    .context("Failed to insert events")?;
 
         Ok(())
     }
 
+    // Enhanced event retrieval with better caching
     // Optimized event retrieval with better caching and batching
     pub async fn get_events(
         &self,
@@ -605,21 +617,25 @@ impl EventStore {
     ) {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.snapshot_interval_secs));
+        interval.tick().await; // Initial tick to run immediately if needed
 
         loop {
             interval.tick().await;
 
-            let candidates = sqlx::query!(
+            // Query to find aggregates that might need a new snapshot
+            // This query now directly compares the max event version with the last snapshot version.
+            let candidates_result = sqlx::query!(
                 r#"
-                SELECT aggregate_id, COUNT(*) as event_count, MAX(version) as max_version
-                FROM events
-                WHERE aggregate_id NOT IN (
-                    SELECT aggregate_id FROM snapshots
-                    WHERE created_at > NOW() - INTERVAL '1 hour'
-                )
-                GROUP BY aggregate_id
-                HAVING COUNT(*) > $1
-                ORDER BY COUNT(*) DESC
+                SELECT
+                    e.aggregate_id,
+                    COUNT(e.id) as event_count,
+                    MAX(e.version) as max_version,
+                    COALESCE(s.version, 0) as last_snapshot_version_db -- Alias for clarity and correct field access
+                FROM events e
+                LEFT JOIN snapshots s ON e.aggregate_id = s.aggregate_id
+                GROUP BY e.aggregate_id, s.version -- Group by s.version to distinguish if there's no snapshot
+                HAVING COUNT(e.id) > $1 AND MAX(e.version) > COALESCE(s.version, 0)
+                ORDER BY COUNT(e.id) DESC
                 LIMIT $2
                 "#,
                 config.snapshot_threshold as i64,
@@ -628,29 +644,45 @@ impl EventStore {
             .fetch_all(&pool)
             .await;
 
-            match candidates {
+            match candidates_result {
                 Ok(candidates) => {
-                    // Process snapshots in parallel
-                    let snapshot_tasks = candidates.into_iter().map(|candidate| {
-                        let pool = pool.clone();
-                        let cache = cache.clone();
-                        let config = config.clone();
+                    // Collect tasks to run in parallel
+                    let mut snapshot_tasks = Vec::new();
 
-                        tokio::spawn(async move {
-                            if let Some(aggregate_id) = candidate.aggregate_id {
+                    for candidate_row in candidates {
+                        // Access fields directly from the generated struct
+                        let aggregate_id = candidate_row.aggregate_id;
+                        let max_version = candidate_row.max_version.unwrap_or(0); // max_version from query is i64, so it needs unwrap_or
+                        let last_snapshot_version =
+                            candidate_row.last_snapshot_version_db.unwrap_or(0); // Coalesce makes it i64, unwrap_or for safety
+
+                        // Only create a snapshot if there are new events since the last snapshot
+                        if max_version > last_snapshot_version {
+                            let pool_clone = pool.clone();
+                            let cache_clone = cache.clone();
+                            let config_clone = config.clone();
+
+                            snapshot_tasks.push(tokio::spawn(async move {
                                 if let Err(e) =
-                                    Self::create_snapshot(&pool, &cache, aggregate_id, &config)
+                                    Self::create_snapshot(&pool_clone, &cache_clone, aggregate_id, &config_clone)
                                         .await
                                 {
                                     warn!("Failed to create snapshot for {}: {}", aggregate_id, e);
+                                } else {
+                                    info!("Successfully created snapshot for aggregate {} at version {}", aggregate_id, max_version);
                                 }
-                            }
-                        })
-                    });
+                            }));
+                        } else {
+                            debug!("Skipping snapshot for aggregate {}: no new events (max_version: {}, last_snapshot_version: {})", aggregate_id, max_version, last_snapshot_version);
+                        }
+                    }
 
                     // Wait for all snapshot tasks to complete
+                    // This ensures backpressure on snapshot creation and provides visibility into their completion.
                     for task in snapshot_tasks {
-                        let _ = task.await;
+                        if let Err(join_error) = task.await {
+                            error!("Snapshot task failed to join: {}", join_error);
+                        }
                     }
                 }
                 Err(e) => {
@@ -659,7 +691,6 @@ impl EventStore {
             }
         }
     }
-
     async fn create_snapshot(
         pool: &PgPool,
         cache: &Arc<RwLock<HashMap<Uuid, CachedSnapshot>>>,
@@ -829,7 +860,7 @@ impl EventStore {
         })
     }
 }
-
+/// Health check response
 #[derive(Debug, serde::Serialize)]
 pub struct EventStoreHealth {
     pub database_status: String,
@@ -839,7 +870,6 @@ pub struct EventStoreHealth {
     pub batch_queue_permits: usize,
     pub metrics: EventStoreMetrics,
 }
-
 // Helper structs
 #[derive(Debug)]
 struct EventData {
@@ -859,6 +889,7 @@ struct EventRow {
     version: i64,
     timestamp: DateTime<Utc>,
 }
+/// Enhanced configuration struct for EventStore
 #[derive(Debug, Clone)]
 pub struct EventStoreConfig {
     pub database_url: String,
@@ -867,22 +898,39 @@ pub struct EventStoreConfig {
     pub acquire_timeout_secs: u64,
     pub idle_timeout_secs: u64,
     pub max_lifetime_secs: u64,
+
+    // Batching configuration
     pub batch_size: usize,
     pub batch_timeout_ms: u64,
     pub max_batch_queue_size: usize,
+    pub batch_processor_count: usize,
+    // Snapshot configuration
+    pub snapshot_threshold: usize,
+    pub snapshot_interval_secs: u64,
+    pub snapshot_cache_ttl_secs: u64,
+    pub max_snapshots_per_run: usize,
 }
+
 impl Default for EventStoreConfig {
     fn default() -> Self {
         Self {
-            database_url: "postgres://user:password@localhost/db".to_string(),
-            max_connections: 100,
-            min_connections: 10,
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://postgres:password@localhost:5432/banking_es".to_string()
+            }),
+            max_connections: 10,
+            min_connections: 1,
             acquire_timeout_secs: 30,
-            idle_timeout_secs: 300,
-            max_lifetime_secs: 3600,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+
             batch_size: 1000,
-            batch_timeout_ms: 100,
+            batch_timeout_ms: 10,
             max_batch_queue_size: 10000,
+            batch_processor_count: 4,
+            snapshot_threshold: 100,
+            snapshot_interval_secs: 60,
+            snapshot_cache_ttl_secs: 3600, // 1 hour
+            max_snapshots_per_run: 100,
         }
     }
 }
