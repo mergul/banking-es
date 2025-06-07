@@ -14,9 +14,9 @@ mod domain;
 mod infrastructure;
 mod web;
 
-use crate::application::AccountService;
 use crate::infrastructure::{AccountRepository, EventStore, ProjectionStore};
 use crate::web::handlers::RateLimitedService;
+use crate::{application::AccountService, infrastructure::EventStoreConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize infrastructure with optimized settings
-    let event_store = EventStore::new_with_pool_size(config.database_pool_size).await?;
+    let event_store = EventStore::new_with_config(EventStoreConfig::default()).await?;
     let projection_store = ProjectionStore::new_with_pool_size(config.database_pool_size).await?;
 
     // Create optimized repository
