@@ -1,8 +1,8 @@
-use uuid::Uuid;
+use crate::domain::{AccountCommand, AccountEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use crate::domain::{AccountEvent, AccountCommand};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -18,15 +18,26 @@ pub enum AccountError {
     #[error("Account not found")]
     NotFound,
     #[error("Insufficient funds: available {available}, requested {requested}")]
-    InsufficientFunds { available: Decimal, requested: Decimal },
+    InsufficientFunds {
+        available: Decimal,
+        requested: Decimal,
+    },
     #[error("Account is closed")]
     AccountClosed,
     #[error("Invalid amount: {0}")]
     InvalidAmount(Decimal),
+    #[error("Event deserialization error: {0}")]
+    EventDeserializationError(String),
+    #[error("Infrastructure error: {0}")]
+    InfrastructureError(String),
 }
 
 impl Account {
-    pub fn new(id: Uuid, owner_name: String, initial_balance: Decimal) -> Result<Self, AccountError> {
+    pub fn new(
+        id: Uuid,
+        owner_name: String,
+        initial_balance: Decimal,
+    ) -> Result<Self, AccountError> {
         if initial_balance < Decimal::ZERO {
             return Err(AccountError::InvalidAmount(initial_balance));
         }
@@ -42,7 +53,11 @@ impl Account {
 
     pub fn apply_event(&mut self, event: &AccountEvent) {
         match event {
-            AccountEvent::AccountCreated { owner_name, initial_balance, .. } => {
+            AccountEvent::AccountCreated {
+                owner_name,
+                initial_balance,
+                ..
+            } => {
                 self.owner_name = owner_name.clone();
                 self.balance = *initial_balance;
                 self.is_active = true;
@@ -60,13 +75,20 @@ impl Account {
         self.version += 1;
     }
 
-    pub fn handle_command(&self, command: &AccountCommand) -> Result<Vec<AccountEvent>, AccountError> {
+    pub fn handle_command(
+        &self,
+        command: &AccountCommand,
+    ) -> Result<Vec<AccountEvent>, AccountError> {
         if !self.is_active && !matches!(command, AccountCommand::CreateAccount { .. }) {
             return Err(AccountError::AccountClosed);
         }
 
         match command {
-            AccountCommand::CreateAccount { account_id, owner_name, initial_balance } => {
+            AccountCommand::CreateAccount {
+                account_id,
+                owner_name,
+                initial_balance,
+            } => {
                 if *initial_balance < Decimal::ZERO {
                     return Err(AccountError::InvalidAmount(*initial_balance));
                 }

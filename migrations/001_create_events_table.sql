@@ -1,6 +1,8 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- High-performance database schema optimizations
 
+CREATE INDEX idx_snapshots_created_at ON snapshots(created_at);
+
 -- 1. Events table with partitioning and optimized indexes
 CREATE TABLE IF NOT EXISTS events (
                                       id UUID PRIMARY KEY,

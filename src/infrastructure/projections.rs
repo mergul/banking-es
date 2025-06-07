@@ -1,13 +1,14 @@
-use sqlx::PgPool;
-use uuid::Uuid;
 use anyhow::Result;
-use tokio::sync::{mpsc, RwLock};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountProjection {
@@ -36,7 +37,7 @@ struct CacheEntry<T> {
 }
 
 #[derive(Clone)]
-pub struct OptimizedProjectionStore {
+pub struct ProjectionStore {
     pool: PgPool,
     account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
     transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
@@ -50,7 +51,7 @@ enum ProjectionUpdate {
     TransactionBatch(Vec<TransactionProjection>),
 }
 
-impl OptimizedProjectionStore {
+impl ProjectionStore {
     pub fn new(pool: PgPool) -> Self {
         let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let account_cache = Arc::new(RwLock::new(HashMap::new()));
@@ -82,15 +83,40 @@ impl OptimizedProjectionStore {
 
         store
     }
+    /// Create EventStore with a specific pool size
+    pub async fn new_with_pool_size(pool_size: u32) -> Result<Self> {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is required"))?;
 
+        Self::new_with_pool_size_and_url(pool_size, &database_url).await
+    }
+
+    /// Create EventStore with a specific pool size and database URL
+    pub async fn new_with_pool_size_and_url(pool_size: u32, database_url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(pool_size)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Duration::from_secs(600))
+            .max_lifetime(Duration::from_secs(1800))
+            .connect(database_url)
+            .await?;
+
+        Ok(Self::new(pool))
+    }
     // Asynchronous projection updates with batching
     pub async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()> {
-        self.update_sender.send(ProjectionUpdate::AccountBatch(accounts))?;
+        self.update_sender
+            .send(ProjectionUpdate::AccountBatch(accounts))?;
         Ok(())
     }
 
-    pub async fn insert_transactions_batch(&self, transactions: Vec<TransactionProjection>) -> Result<()> {
-        self.update_sender.send(ProjectionUpdate::TransactionBatch(transactions))?;
+    pub async fn insert_transactions_batch(
+        &self,
+        transactions: Vec<TransactionProjection>,
+    ) -> Result<()> {
+        self.update_sender
+            .send(ProjectionUpdate::TransactionBatch(transactions))?;
         Ok(())
     }
 
@@ -115,23 +141,31 @@ impl OptimizedProjectionStore {
             "#,
             account_id
         )
-            .fetch_optional(&self.pool)
-            .await?;
+        .fetch_optional(&self.pool)
+        .await?;
 
         // Update cache
         if let Some(ref account) = account {
             let mut cache = self.account_cache.write().await;
-            cache.insert(account_id, CacheEntry {
-                data: account.clone(),
-                last_accessed: Instant::now(),
-                version: self.cache_version.load(std::sync::atomic::Ordering::Relaxed),
-            });
+            cache.insert(
+                account_id,
+                CacheEntry {
+                    data: account.clone(),
+                    last_accessed: Instant::now(),
+                    version: self
+                        .cache_version
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                },
+            );
         }
 
         Ok(account)
     }
 
-    pub async fn get_account_transactions(&self, account_id: Uuid) -> Result<Vec<TransactionProjection>> {
+    pub async fn get_account_transactions(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TransactionProjection>> {
         // Try cache first
         {
             let cache = self.transaction_cache.read().await;
@@ -152,17 +186,22 @@ impl OptimizedProjectionStore {
             "#,
             account_id
         )
-            .fetch_all(&self.pool)
-            .await?;
+        .fetch_all(&self.pool)
+        .await?;
 
         // Update cache
         {
             let mut cache = self.transaction_cache.write().await;
-            cache.insert(account_id, CacheEntry {
-                data: transactions.clone(),
-                last_accessed: Instant::now(),
-                version: self.cache_version.load(std::sync::atomic::Ordering::Relaxed),
-            });
+            cache.insert(
+                account_id,
+                CacheEntry {
+                    data: transactions.clone(),
+                    last_accessed: Instant::now(),
+                    version: self
+                        .cache_version
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                },
+            );
         }
 
         Ok(transactions)
@@ -180,9 +219,9 @@ impl OptimizedProjectionStore {
             LIMIT 10000
             "#
         )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(Into::into)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     // Background batch processor
@@ -213,8 +252,8 @@ impl OptimizedProjectionStore {
             // Flush if batch size reached or timeout exceeded
             if account_batch.len() >= BATCH_SIZE
                 || transaction_batch.len() >= BATCH_SIZE
-                || last_flush.elapsed() >= BATCH_TIMEOUT {
-
+                || last_flush.elapsed() >= BATCH_TIMEOUT
+            {
                 Self::flush_batches(
                     &pool,
                     &mut account_batch,
@@ -222,7 +261,8 @@ impl OptimizedProjectionStore {
                     &account_cache,
                     &transaction_cache,
                     &cache_version,
-                ).await;
+                )
+                .await;
 
                 last_flush = Instant::now();
             }
@@ -258,11 +298,14 @@ impl OptimizedProjectionStore {
                 let mut cache = account_cache.write().await;
                 let version = cache_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for account in account_batch.drain(..) {
-                    cache.insert(account.id, CacheEntry {
-                        data: account,
-                        last_accessed: Instant::now(),
-                        version,
-                    });
+                    cache.insert(
+                        account.id,
+                        CacheEntry {
+                            data: account,
+                            last_accessed: Instant::now(),
+                            version,
+                        },
+                    );
                 }
             }
         }
@@ -337,7 +380,10 @@ impl OptimizedProjectionStore {
 
         let ids: Vec<Uuid> = transactions.iter().map(|t| t.id).collect();
         let account_ids: Vec<Uuid> = transactions.iter().map(|t| t.account_id).collect();
-        let types: Vec<String> = transactions.iter().map(|t| t.transaction_type.clone()).collect();
+        let types: Vec<String> = transactions
+            .iter()
+            .map(|t| t.transaction_type.clone())
+            .collect();
         let amounts: Vec<Decimal> = transactions.iter().map(|t| t.amount).collect();
         let timestamps: Vec<DateTime<Utc>> = transactions.iter().map(|t| t.timestamp).collect();
 

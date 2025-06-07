@@ -1,22 +1,36 @@
-use uuid::Uuid;
-use anyhow::Result;
+use std::sync::Arc;
+
 use crate::domain::{Account, AccountCommand, AccountError};
-use crate::infrastructure::{AccountRepository, ProjectionStore, AccountProjection, TransactionProjection};
-use rust_decimal::Decimal;
+use crate::infrastructure::{
+    AccountProjection, AccountRepositoryTrait, ProjectionStore, TransactionProjection,
+};
+use anyhow::Result;
 use chrono::Utc;
+use rust_decimal::Decimal;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AccountService {
-    repository: AccountRepository,
+    repository: Arc<dyn AccountRepositoryTrait + 'static>,
     projections: ProjectionStore,
 }
 
 impl AccountService {
-    pub fn new(repository: AccountRepository, projections: ProjectionStore) -> Self {
-        Self { repository, projections }
+    pub fn new(
+        repository: Arc<dyn AccountRepositoryTrait + 'static>,
+        projections: ProjectionStore,
+    ) -> Self {
+        Self {
+            repository,
+            projections,
+        }
     }
 
-    pub async fn create_account(&self, owner_name: String, initial_balance: Decimal) -> Result<Uuid, AccountError> {
+    pub async fn create_account(
+        &self,
+        owner_name: String,
+        initial_balance: Decimal,
+    ) -> Result<Uuid, AccountError> {
         let account_id = Uuid::new_v4();
         let command = AccountCommand::CreateAccount {
             account_id,
@@ -27,7 +41,9 @@ impl AccountService {
         let account = Account::default();
         let events = account.handle_command(&command)?;
 
-        self.repository.save(&account, events.clone()).await
+        self.repository
+            .save(&account, events.clone())
+            .await
             .map_err(|_| AccountError::NotFound)?;
 
         // Update projections
@@ -39,14 +55,25 @@ impl AccountService {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        self.projections.upsert_account(&projection).await
+
+        // Use the batch method with a vector containing one item
+        self.projections
+            .upsert_accounts_batch(vec![projection])
+            .await
             .map_err(|_| AccountError::NotFound)?;
 
         Ok(account_id)
     }
 
-    pub async fn deposit_money(&self, account_id: Uuid, amount: Decimal) -> Result<(), AccountError> {
-        let mut account = self.repository.get_by_id(account_id).await?
+    pub async fn deposit_money(
+        &self,
+        account_id: Uuid,
+        amount: Decimal,
+    ) -> Result<(), AccountError> {
+        let mut account = self
+            .repository
+            .get_by_id(account_id)
+            .await?
             .ok_or(AccountError::NotFound)?;
 
         let command = AccountCommand::DepositMoney { account_id, amount };
@@ -57,7 +84,9 @@ impl AccountService {
             account.apply_event(event);
         }
 
-        self.repository.save(&account, events.clone()).await
+        self.repository
+            .save(&account, events.clone())
+            .await
             .map_err(|_| AccountError::NotFound)?;
 
         // Update projections
@@ -66,8 +95,15 @@ impl AccountService {
         Ok(())
     }
 
-    pub async fn withdraw_money(&self, account_id: Uuid, amount: Decimal) -> Result<(), AccountError> {
-        let mut account = self.repository.get_by_id(account_id).await?
+    pub async fn withdraw_money(
+        &self,
+        account_id: Uuid,
+        amount: Decimal,
+    ) -> Result<(), AccountError> {
+        let mut account = self
+            .repository
+            .get_by_id(account_id)
+            .await?
             .ok_or(AccountError::NotFound)?;
 
         let command = AccountCommand::WithdrawMoney { account_id, amount };
@@ -78,7 +114,9 @@ impl AccountService {
             account.apply_event(event);
         }
 
-        self.repository.save(&account, events.clone()).await
+        self.repository
+            .save(&account, events.clone())
+            .await
             .map_err(|_| AccountError::NotFound)?;
 
         // Update projections
@@ -87,37 +125,62 @@ impl AccountService {
         Ok(())
     }
 
-    pub async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>, AccountError> {
-        self.projections.get_account(account_id).await
+    pub async fn get_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<AccountProjection>, AccountError> {
+        self.projections
+            .get_account(account_id)
+            .await
             .map_err(|_| AccountError::NotFound)
     }
 
     pub async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>, AccountError> {
-        self.projections.get_all_accounts().await
+        self.projections
+            .get_all_accounts()
+            .await
             .map_err(|_| AccountError::NotFound)
     }
 
-    pub async fn get_account_transactions(&self, account_id: Uuid) -> Result<Vec<TransactionProjection>, AccountError> {
-        self.projections.get_account_transactions(account_id).await
+    pub async fn get_account_transactions(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TransactionProjection>, AccountError> {
+        self.projections
+            .get_account_transactions(account_id)
+            .await
             .map_err(|_| AccountError::NotFound)
     }
 
-    async fn update_projections_from_events(&self, events: &[crate::domain::AccountEvent]) -> Result<(), AccountError> {
+    async fn update_projections_from_events(
+        &self,
+        events: &[crate::domain::AccountEvent],
+    ) -> Result<(), AccountError> {
         use crate::domain::AccountEvent;
+
+        let mut account_updates = Vec::new();
+        let mut transaction_updates = Vec::new();
 
         for event in events {
             match event {
-                AccountEvent::MoneyDeposited { account_id, amount, transaction_id } => {
-                    // Update account balance
-                    if let Some(mut account_proj) = self.projections.get_account(*account_id).await
-                        .map_err(|_| AccountError::NotFound)? {
+                AccountEvent::MoneyDeposited {
+                    account_id,
+                    amount,
+                    transaction_id,
+                } => {
+                    // Prepare account balance update
+                    if let Some(mut account_proj) = self
+                        .projections
+                        .get_account(*account_id)
+                        .await
+                        .map_err(|_| AccountError::NotFound)?
+                    {
                         account_proj.balance += amount;
                         account_proj.updated_at = Utc::now();
-                        self.projections.upsert_account(&account_proj).await
-                            .map_err(|_| AccountError::NotFound)?;
+                        account_updates.push(account_proj);
                     }
 
-                    // Add transaction record
+                    // Prepare transaction record
                     let transaction = TransactionProjection {
                         id: *transaction_id,
                         account_id: *account_id,
@@ -125,20 +188,26 @@ impl AccountService {
                         amount: *amount,
                         timestamp: Utc::now(),
                     };
-                    self.projections.insert_transaction(&transaction).await
-                        .map_err(|_| AccountError::NotFound)?;
+                    transaction_updates.push(transaction);
                 }
-                AccountEvent::MoneyWithdrawn { account_id, amount, transaction_id } => {
-                    // Update account balance
-                    if let Some(mut account_proj) = self.projections.get_account(*account_id).await
-                        .map_err(|_| AccountError::NotFound)? {
+                AccountEvent::MoneyWithdrawn {
+                    account_id,
+                    amount,
+                    transaction_id,
+                } => {
+                    // Prepare account balance update
+                    if let Some(mut account_proj) = self
+                        .projections
+                        .get_account(*account_id)
+                        .await
+                        .map_err(|_| AccountError::NotFound)?
+                    {
                         account_proj.balance -= amount;
                         account_proj.updated_at = Utc::now();
-                        self.projections.upsert_account(&account_proj).await
-                            .map_err(|_| AccountError::NotFound)?;
+                        account_updates.push(account_proj);
                     }
 
-                    // Add transaction record
+                    // Prepare transaction record
                     let transaction = TransactionProjection {
                         id: *transaction_id,
                         account_id: *account_id,
@@ -146,11 +215,25 @@ impl AccountService {
                         amount: *amount,
                         timestamp: Utc::now(),
                     };
-                    self.projections.insert_transaction(&transaction).await
-                        .map_err(|_| AccountError::NotFound)?;
+                    transaction_updates.push(transaction);
                 }
                 _ => {} // Handle other events as needed
             }
+        }
+
+        // Batch update projections
+        if !account_updates.is_empty() {
+            self.projections
+                .upsert_accounts_batch(account_updates)
+                .await
+                .map_err(|_| AccountError::NotFound)?;
+        }
+
+        if !transaction_updates.is_empty() {
+            self.projections
+                .insert_transactions_batch(transaction_updates)
+                .await
+                .map_err(|_| AccountError::NotFound)?;
         }
 
         Ok(())
