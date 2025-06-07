@@ -13,9 +13,26 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 thiserror = "1.0"
+base64ct = "=1.6.0"
+icu_properties = "=2.0.0-beta1"
+icu_properties_data = "=2.0.0-beta1"
+icu_locale_core = "=2.0.0-beta1"
+icu_collections = "=2.0.0-beta1"
+litemap = "=0.7.4"
+zerotrie = "=0.2.0"
+writeable = "=0.6.0"
+home = "=0.5.9"
+tinystr = "=0.8.0"
+zerofrom = "=0.1.5"
+zerovec = "=0.11.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 rust_decimal = { version = "1.37.1", features = ["serde"] }
 bigdecimal = {version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+mockall = "0.11"

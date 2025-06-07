@@ -1,16 +1,17 @@
 use uuid::Uuid;
 use anyhow::Result;
 use crate::domain::{Account, AccountCommand, AccountEvent, AccountError};
-use crate::infrastructure::AccountRepository;
+use crate::infrastructure::repository::AccountRepositoryTrait; // Changed
 use rust_decimal::Decimal;
+use std::sync::Arc; // Added
 
 #[derive(Clone)]
 pub struct AccountCommandHandler {
-    repository: AccountRepository,
+    repository: Arc<dyn AccountRepositoryTrait>, // Changed
 }
 
 impl AccountCommandHandler {
-    pub fn new(repository: AccountRepository) -> Self {
+    pub fn new(repository: Arc<dyn AccountRepositoryTrait>) -> Self { // Changed
         Self { repository }
     }
 
@@ -26,11 +27,21 @@ impl AccountCommandHandler {
             initial_balance,
         };
 
-        let account = Account::default();
-        let events = account.handle_command(&command)?;
+        // Account::handle_command for CreateAccount is static-like, doesn't use self's state.
+        let events = Account::default().handle_command(&command)?;
 
-        self.repository.save(&account, events).await
-            .map_err(|_| AccountError::NotFound)?;
+        // For CreateAccount, the expected version for the EventStore is 0.
+        // The Account object passed to repository.save needs to reflect this.
+        let temp_account_for_save = Account {
+            id: account_id,
+            owner_name: String::new(),
+            balance: Decimal::ZERO,
+            is_active: false, // Initial state before AccountCreated event is applied by store
+            version: 0, // Version before this first event
+        };
+
+        self.repository.save(&temp_account_for_save, events).await
+            .map_err(|e| AccountError::InfrastructureError(e.to_string()))?; // Changed error mapping
 
         Ok(account_id)
     }
@@ -46,8 +57,10 @@ impl AccountCommandHandler {
         let command = AccountCommand::DepositMoney { account_id, amount };
         let events = account.handle_command(&command)?;
 
+        // Pass the updated account (which now has an incremented version) to save.
+        // The AccountRepository's save method uses this account's version as the expected_version for optimistic locking.
         self.repository.save(&account, events.clone()).await
-            .map_err(|_| AccountError::NotFound)?;
+            .map_err(|e| AccountError::InfrastructureError(e.to_string()))?; // Changed error mapping
 
         Ok(events)
     }
@@ -64,7 +77,7 @@ impl AccountCommandHandler {
         let events = account.handle_command(&command)?;
 
         self.repository.save(&account, events.clone()).await
-            .map_err(|_| AccountError::NotFound)?;
+            .map_err(|e| AccountError::InfrastructureError(e.to_string()))?; // Changed error mapping
 
         Ok(events)
     }
@@ -81,7 +94,7 @@ impl AccountCommandHandler {
         let events = account.handle_command(&command)?;
 
         self.repository.save(&account, events.clone()).await
-            .map_err(|_| AccountError::NotFound)?;
+            .map_err(|e| AccountError::InfrastructureError(e.to_string()))?; // Changed error mapping
 
         Ok(events)
     }
@@ -89,11 +102,11 @@ impl AccountCommandHandler {
 
 #[derive(Clone)]
 pub struct AccountQueryHandler {
-    repository: AccountRepository,
+    repository: Arc<dyn AccountRepositoryTrait>, // Changed
 }
 
 impl AccountQueryHandler {
-    pub fn new(repository: AccountRepository) -> Self {
+    pub fn new(repository: Arc<dyn AccountRepositoryTrait>) -> Self { // Changed
         Self { repository }
     }
 

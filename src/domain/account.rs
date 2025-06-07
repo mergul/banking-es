@@ -23,6 +23,10 @@ pub enum AccountError {
     AccountClosed,
     #[error("Invalid amount: {0}")]
     InvalidAmount(Decimal),
+    #[error("Event deserialization error: {0}")]
+    EventDeserializationError(String),
+    #[error("Infrastructure error: {0}")]
+    InfrastructureError(String),
 }
 
 impl Account {
