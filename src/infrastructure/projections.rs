@@ -1,13 +1,13 @@
 use sqlx::PgPool;
 use uuid::Uuid;
-use rust_decimal::Decimal;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use tokio::sync::{mpsc, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::{interval, Duration, Instant};
+use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountProjection {
@@ -32,124 +32,107 @@ pub struct TransactionProjection {
 struct CacheEntry<T> {
     data: T,
     last_accessed: Instant,
+    version: u64,
 }
 
 #[derive(Clone)]
-pub struct ProjectionStore {
+pub struct OptimizedProjectionStore {
     pool: PgPool,
     account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
     transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
+    update_sender: mpsc::UnboundedSender<ProjectionUpdate>,
+    cache_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl ProjectionStore {
+#[derive(Debug)]
+enum ProjectionUpdate {
+    AccountBatch(Vec<AccountProjection>),
+    TransactionBatch(Vec<TransactionProjection>),
+}
+
+impl OptimizedProjectionStore {
     pub fn new(pool: PgPool) -> Self {
+        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+        let account_cache = Arc::new(RwLock::new(HashMap::new()));
+        let transaction_cache = Arc::new(RwLock::new(HashMap::new()));
+        let cache_version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let store = Self {
-            pool,
-            account_cache: Arc::new(RwLock::new(HashMap::new())),
-            transaction_cache: Arc::new(RwLock::new(HashMap::new())),
+            pool: pool.clone(),
+            account_cache: account_cache.clone(),
+            transaction_cache: transaction_cache.clone(),
+            update_sender,
+            cache_version: cache_version.clone(),
         };
 
-        // Start cache cleanup task
-        let store_clone = store.clone();
-        tokio::spawn(async move {
-            store_clone.cache_cleanup_task().await;
-        });
+        // Start background batch processor
+        tokio::spawn(Self::batch_update_processor(
+            pool.clone(),
+            update_receiver,
+            account_cache.clone(),
+            transaction_cache.clone(),
+            cache_version,
+        ));
+
+        // Start cache cleanup worker
+        tokio::spawn(Self::cache_cleanup_worker(
+            account_cache.clone(),
+            transaction_cache.clone(),
+        ));
 
         store
     }
 
-    async fn cache_cleanup_task(&self) {
-        let mut interval = interval(Duration::from_secs(60)); // Cleanup every minute
-
-        loop {
-            interval.tick().await;
-
-            let cutoff = Instant::now() - Duration::from_secs(300); // 5 minutes TTL
-
-            // Cleanup account cache
-            {
-                let mut cache = self.account_cache.write().await;
-                cache.retain(|_, entry| entry.last_accessed > cutoff);
-            }
-
-            // Cleanup transaction cache
-            {
-                let mut cache = self.transaction_cache.write().await;
-                cache.retain(|_, entry| entry.last_accessed > cutoff);
-            }
-        }
+    // Asynchronous projection updates with batching
+    pub async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()> {
+        self.update_sender.send(ProjectionUpdate::AccountBatch(accounts))?;
+        Ok(())
     }
 
-    pub async fn get_account(&self, id: Uuid) -> Result<Option<AccountProjection>> {
-        // Check cache first
+    pub async fn insert_transactions_batch(&self, transactions: Vec<TransactionProjection>) -> Result<()> {
+        self.update_sender.send(ProjectionUpdate::TransactionBatch(transactions))?;
+        Ok(())
+    }
+
+    // High-performance cached reads
+    pub async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>> {
+        // Try cache first
         {
             let cache = self.account_cache.read().await;
-            if let Some(entry) = cache.get(&id) {
+            if let Some(entry) = cache.get(&account_id) {
+                // Update access time (we'll do this periodically to avoid write locks)
                 return Ok(Some(entry.data.clone()));
             }
         }
 
-        // Load from database
-        let account = self.load_account_from_db(id).await?;
+        // Cache miss - fetch from database
+        let account = sqlx::query_as!(
+            AccountProjection,
+            r#"
+            SELECT id, owner_name, balance, is_active, created_at, updated_at
+            FROM account_projections
+            WHERE id = $1
+            "#,
+            account_id
+        )
+            .fetch_optional(&self.pool)
+            .await?;
 
         // Update cache
-        if let Some(ref acc) = account {
+        if let Some(ref account) = account {
             let mut cache = self.account_cache.write().await;
-            cache.insert(id, CacheEntry {
-                data: acc.clone(),
+            cache.insert(account_id, CacheEntry {
+                data: account.clone(),
                 last_accessed: Instant::now(),
+                version: self.cache_version.load(std::sync::atomic::Ordering::Relaxed),
             });
         }
 
         Ok(account)
     }
 
-    async fn load_account_from_db(&self, id: Uuid) -> Result<Option<AccountProjection>> {
-        let row = sqlx::query!(
-            r#"
-            SELECT id, owner_name, balance, is_active, created_at, updated_at
-            FROM account_projections
-            WHERE id = $1
-            "#,
-            id
-        )
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row.map(|r| AccountProjection {
-            id: r.id,
-            owner_name: r.owner_name,
-            balance: r.balance,
-            is_active: r.is_active,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        }))
-    }
-
-    pub async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>> {
-        // For bulk operations, go directly to DB to avoid cache bloat
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, owner_name, balance, is_active, created_at, updated_at
-            FROM account_projections
-            ORDER BY created_at DESC
-            "#
-        )
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(rows.into_iter().map(|r| AccountProjection {
-            id: r.id,
-            owner_name: r.owner_name,
-            balance: r.balance,
-            is_active: r.is_active,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        }).collect())
-    }
-
     pub async fn get_account_transactions(&self, account_id: Uuid) -> Result<Vec<TransactionProjection>> {
-        // Check cache first
+        // Try cache first
         {
             let cache = self.transaction_cache.read().await;
             if let Some(entry) = cache.get(&account_id) {
@@ -157,8 +140,20 @@ impl ProjectionStore {
             }
         }
 
-        // Load from database
-        let transactions = self.load_transactions_from_db(account_id).await?;
+        // Cache miss - fetch from database
+        let transactions = sqlx::query_as!(
+            TransactionProjection,
+            r#"
+            SELECT id, account_id, transaction_type, amount, timestamp
+            FROM transaction_projections
+            WHERE account_id = $1
+            ORDER BY timestamp DESC
+            LIMIT 1000
+            "#,
+            account_id
+        )
+            .fetch_all(&self.pool)
+            .await?;
 
         // Update cache
         {
@@ -166,104 +161,145 @@ impl ProjectionStore {
             cache.insert(account_id, CacheEntry {
                 data: transactions.clone(),
                 last_accessed: Instant::now(),
+                version: self.cache_version.load(std::sync::atomic::Ordering::Relaxed),
             });
         }
 
         Ok(transactions)
     }
 
-    async fn load_transactions_from_db(&self, account_id: Uuid) -> Result<Vec<TransactionProjection>> {
-        let rows = sqlx::query!(
+    pub async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>> {
+        // For frequently accessed data, consider a dedicated cache
+        sqlx::query_as!(
+            AccountProjection,
             r#"
-            SELECT id, account_id, transaction_type, amount, timestamp
-            FROM transaction_projections
-            WHERE account_id = $1
-            ORDER BY timestamp DESC
-            LIMIT 100
-            "#,
-            account_id
+            SELECT id, owner_name, balance, is_active, created_at, updated_at
+            FROM account_projections
+            WHERE is_active = true
+            ORDER BY created_at DESC
+            LIMIT 10000
+            "#
         )
             .fetch_all(&self.pool)
-            .await?;
-
-        Ok(rows.into_iter().map(|r| TransactionProjection {
-            id: r.id,
-            account_id: r.account_id,
-            transaction_type: r.transaction_type,
-            amount: r.amount,
-            timestamp: r.timestamp,
-        }).collect())
+            .await
+            .map_err(Into::into)
     }
 
-    pub async fn upsert_account(&self, account: &AccountProjection) -> Result<()> {
-        // Update database
-        sqlx::query!(
-            r#"
-            INSERT INTO account_projections (id, owner_name, balance, is_active, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (id) DO UPDATE SET
-                owner_name = EXCLUDED.owner_name,
-                balance = EXCLUDED.balance,
-                is_active = EXCLUDED.is_active,
-                updated_at = EXCLUDED.updated_at
-            "#,
-            account.id,
-            account.owner_name,
-            account.balance,
-            account.is_active,
-            account.created_at,
-            account.updated_at
-        )
-            .execute(&self.pool)
-            .await?;
+    // Background batch processor
+    async fn batch_update_processor(
+        pool: PgPool,
+        mut receiver: mpsc::UnboundedReceiver<ProjectionUpdate>,
+        account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
+        transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
+        cache_version: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        const BATCH_SIZE: usize = 5000;
+        const BATCH_TIMEOUT: Duration = Duration::from_millis(20);
 
-        // Update cache
-        {
-            let mut cache = self.account_cache.write().await;
-            cache.insert(account.id, CacheEntry {
-                data: account.clone(),
-                last_accessed: Instant::now(),
-            });
+        let mut account_batch = Vec::new();
+        let mut transaction_batch = Vec::new();
+        let mut last_flush = Instant::now();
+
+        while let Some(update) = receiver.recv().await {
+            match update {
+                ProjectionUpdate::AccountBatch(accounts) => {
+                    account_batch.extend(accounts);
+                }
+                ProjectionUpdate::TransactionBatch(transactions) => {
+                    transaction_batch.extend(transactions);
+                }
+            }
+
+            // Flush if batch size reached or timeout exceeded
+            if account_batch.len() >= BATCH_SIZE
+                || transaction_batch.len() >= BATCH_SIZE
+                || last_flush.elapsed() >= BATCH_TIMEOUT {
+
+                Self::flush_batches(
+                    &pool,
+                    &mut account_batch,
+                    &mut transaction_batch,
+                    &account_cache,
+                    &transaction_cache,
+                    &cache_version,
+                ).await;
+
+                last_flush = Instant::now();
+            }
+        }
+    }
+
+    async fn flush_batches(
+        pool: &PgPool,
+        account_batch: &mut Vec<AccountProjection>,
+        transaction_batch: &mut Vec<TransactionProjection>,
+        account_cache: &Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
+        transaction_cache: &Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
+        cache_version: &Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                eprintln!("Failed to start transaction: {}", e);
+                return;
+            }
+        };
+
+        // Process account updates
+        if !account_batch.is_empty() {
+            if let Err(e) = Self::bulk_upsert_accounts(&mut tx, account_batch).await {
+                eprintln!("Failed to upsert accounts: {}", e);
+                let _ = tx.rollback().await;
+                return;
+            }
+
+            // Update cache
+            {
+                let mut cache = account_cache.write().await;
+                let version = cache_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for account in account_batch.drain(..) {
+                    cache.insert(account.id, CacheEntry {
+                        data: account,
+                        last_accessed: Instant::now(),
+                        version,
+                    });
+                }
+            }
         }
 
-        Ok(())
-    }
+        // Process transaction updates
+        if !transaction_batch.is_empty() {
+            if let Err(e) = Self::bulk_insert_transactions(&mut tx, transaction_batch).await {
+                eprintln!("Failed to insert transactions: {}", e);
+                let _ = tx.rollback().await;
+                return;
+            }
 
-    pub async fn insert_transaction(&self, transaction: &TransactionProjection) -> Result<()> {
-        // Update database
-        sqlx::query!(
-            r#"
-            INSERT INTO transaction_projections (id, account_id, transaction_type, amount, timestamp)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO NOTHING
-            "#,
-            transaction.id,
-            transaction.account_id,
-            transaction.transaction_type,
-            transaction.amount,
-            transaction.timestamp
-        )
-            .execute(&self.pool)
-            .await?;
-
-        // Invalidate transaction cache for this account
-        {
-            let mut cache = self.transaction_cache.write().await;
-            cache.remove(&transaction.account_id);
+            // Invalidate transaction cache for affected accounts
+            {
+                let mut cache = transaction_cache.write().await;
+                for transaction in transaction_batch.drain(..) {
+                    cache.remove(&transaction.account_id);
+                }
+            }
         }
 
-        Ok(())
+        if let Err(e) = tx.commit().await {
+            eprintln!("Failed to commit transaction: {}", e);
+        }
     }
 
-    // Batch operations for high throughput
-    pub async fn upsert_accounts_batch(&self, accounts: &[AccountProjection]) -> Result<()> {
+    async fn bulk_upsert_accounts(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        accounts: &[AccountProjection],
+    ) -> Result<()> {
         if accounts.is_empty() {
             return Ok(());
         }
 
-        // Batch upsert using UNNEST
         let ids: Vec<Uuid> = accounts.iter().map(|a| a.id).collect();
-        let owner_names: Vec<String> = accounts.iter().map(|a| a.owner_name.clone()).collect();        let balances: Vec<Decimal> = accounts.iter().map(|a| a.balance).collect();
+        let owner_names: Vec<String> = accounts.iter().map(|a| a.owner_name.clone()).collect();
+        let balances: Vec<Decimal> = accounts.iter().map(|a| a.balance).collect();
         let is_actives: Vec<bool> = accounts.iter().map(|a| a.is_active).collect();
         let created_ats: Vec<DateTime<Utc>> = accounts.iter().map(|a| a.created_at).collect();
         let updated_ats: Vec<DateTime<Utc>> = accounts.iter().map(|a| a.updated_at).collect();
@@ -285,32 +321,24 @@ impl ProjectionStore {
             &created_ats,
             &updated_ats
         )
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
-
-        // Update cache for all accounts
-        {
-            let mut cache = self.account_cache.write().await;
-            for account in accounts {
-                cache.insert(account.id, CacheEntry {
-                    data: account.clone(),
-                    last_accessed: Instant::now(),
-                });
-            }
-        }
 
         Ok(())
     }
 
-    pub async fn insert_transactions_batch(&self, transactions: &[TransactionProjection]) -> Result<()> {
+    async fn bulk_insert_transactions(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        transactions: &[TransactionProjection],
+    ) -> Result<()> {
         if transactions.is_empty() {
             return Ok(());
         }
 
-        // Batch insert using UNNEST
         let ids: Vec<Uuid> = transactions.iter().map(|t| t.id).collect();
         let account_ids: Vec<Uuid> = transactions.iter().map(|t| t.account_id).collect();
-        let types: Vec<String> = transactions.iter().map(|t| t.transaction_type.clone()).collect();        let amounts: Vec<Decimal> = transactions.iter().map(|t| t.amount).collect();
+        let types: Vec<String> = transactions.iter().map(|t| t.transaction_type.clone()).collect();
+        let amounts: Vec<Decimal> = transactions.iter().map(|t| t.amount).collect();
         let timestamps: Vec<DateTime<Utc>> = transactions.iter().map(|t| t.timestamp).collect();
 
         sqlx::query!(
@@ -325,17 +353,35 @@ impl ProjectionStore {
             &amounts,
             &timestamps
         )
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
 
-        // Invalidate cache for affected accounts
-        {
-            let mut cache = self.transaction_cache.write().await;
-            for transaction in transactions {
-                cache.remove(&transaction.account_id);
+        Ok(())
+    }
+
+    // Cache cleanup worker
+    async fn cache_cleanup_worker(
+        account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
+        transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+
+        loop {
+            interval.tick().await;
+
+            let cutoff = Instant::now() - Duration::from_secs(1800); // 30 minutes
+
+            // Clean account cache
+            {
+                let mut cache = account_cache.write().await;
+                cache.retain(|_, entry| entry.last_accessed > cutoff);
+            }
+
+            // Clean transaction cache
+            {
+                let mut cache = transaction_cache.write().await;
+                cache.retain(|_, entry| entry.last_accessed > cutoff);
             }
         }
-
-        Ok(())
     }
 }
