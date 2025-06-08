@@ -9,6 +9,12 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLay
 use tracing::{info, Level};
 use tracing_subscriber;
 
+// Import redis client and trait abstractions
+use redis::Client as NativeRedisClient; // Renamed for clarity
+use crate::infrastructure::{RealRedisClient, RedisClientTrait}; // Added trait imports
+use std::env;
+use std::sync::Arc; // Added for Arc
+
 mod application;
 mod domain;
 mod infrastructure;
@@ -39,11 +45,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_store = EventStore::new_with_config(EventStoreConfig::default()).await?;
     let projection_store = ProjectionStore::new_with_pool_size(config.database_pool_size).await?;
 
-    // Create optimized repository
-    let repository = Arc::new(AccountRepository::new(event_store));
+    // Initialize Redis Client
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| {
+        info!("REDIS_URL not set, defaulting to redis://127.0.0.1:6379");
+        "redis://127.0.0.1:6379".to_string()
+    });
+    let native_redis_client = NativeRedisClient::open(redis_url) // Store native client
+        .map_err(|e| {
+            tracing::error!("Failed to create Redis client: {}", e);
+            Box::new(e) as Box<dyn std::error::Error>
+        })?;
+    info!("Successfully connected to Redis.");
 
-    // Create high-performance service
-    let account_service = AccountService::new(repository, projection_store);
+    // Wrap native client with the trait implementation
+    let redis_client_trait: Arc<dyn RedisClientTrait> = RealRedisClient::new(native_redis_client);
+
+
+    // Create optimized repository with Redis client trait object
+    let repository = Arc::new(AccountRepository::new(event_store, redis_client_trait.clone()));
+
+    // Create high-performance service with Redis client trait object
+    let account_service = AccountService::new(repository, projection_store, redis_client_trait.clone());
 
     // Wrap with rate limiting
     let rate_limited_service =

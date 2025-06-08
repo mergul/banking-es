@@ -32,6 +32,7 @@ icu_properties = "2.0.1"
 icu_properties_data = "2.0.1"
 icu_locale_core = "2.0.0"
 icu_collections = "2.0.0"
+redis = { version = "0.25", features = ["tokio-comp"] }
 # Web framework
 
 # Serialization
