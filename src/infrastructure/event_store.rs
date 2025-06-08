@@ -32,13 +32,15 @@ struct BatchedEvent {
     created_at: Instant,
     priority: EventPriority,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum EventPriority {
+pub enum EventPriority {
     Low = 0,
     Normal = 1,
     High = 2,
     Critical = 3,
 }
+
 #[derive(Debug, Clone)]
 struct CachedSnapshot {
     aggregate_id: Uuid,
@@ -48,6 +50,7 @@ struct CachedSnapshot {
     // Add TTL for cache invalidation
     ttl: Duration,
 }
+
 #[derive(Debug, Default, Serialize)]
 pub struct EventStoreMetrics {
     pub events_processed: AtomicU64,
@@ -56,6 +59,13 @@ pub struct EventStoreMetrics {
     pub avg_batch_size: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
+    pub success_rate: f64,
+    pub cache_hit_rate: f64,
+    pub connection_acquire_time: AtomicU64,
+    pub connection_acquire_errors: AtomicU64,
+    pub connection_reuse_count: AtomicU64,
+    pub connection_timeout_count: AtomicU64,
+    pub connection_lifetime: AtomicU64,
 }
 
 impl EventStoreMetrics {
@@ -67,6 +77,43 @@ impl EventStoreMetrics {
             avg_batch_size: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            success_rate: 0.0,
+            cache_hit_rate: 0.0,
+            connection_acquire_time: AtomicU64::new(0),
+            connection_acquire_errors: AtomicU64::new(0),
+            connection_reuse_count: AtomicU64::new(0),
+            connection_timeout_count: AtomicU64::new(0),
+            connection_lifetime: AtomicU64::new(0),
+        }
+    }
+}
+
+// Add a new struct for retry events
+#[derive(Debug, Clone)]
+struct RetryEvent {
+    aggregate_id: Uuid,
+    events: Vec<AccountEvent>,
+    expected_version: i64,
+    created_at: Instant,
+    priority: EventPriority,
+}
+
+// Add this struct for retry configuration
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_retries: u32,
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    pub backoff_factor: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
         }
     }
 }
@@ -120,6 +167,7 @@ impl EventStore {
 
         store
     }
+
     /// Create EventStore with a specific pool size
     pub async fn new_with_config(config: EventStoreConfig) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -131,8 +179,21 @@ impl EventStore {
             // Enable prepared statement caching
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
-                    // Pre-warm prepared statements
-                    sqlx::query("SELECT 1").execute(conn).await?;
+                    // Set all session parameters and warm up prepared statements in a single query
+                    sqlx::query(
+                        r#"
+                        SET SESSION synchronous_commit = 'off';
+                        SET SESSION work_mem = '64MB';
+                        SET SESSION maintenance_work_mem = '256MB';
+                        SET SESSION effective_cache_size = '4GB';
+                        SET SESSION random_page_cost = 1.1;
+                        SET SESSION effective_io_concurrency = 200;
+                        SELECT 1;
+                        "#,
+                    )
+                    .execute(conn)
+                    .await?;
+
                     Ok(())
                 })
             })
@@ -140,7 +201,15 @@ impl EventStore {
             .await
             .context("Failed to connect to database")?;
 
-        Ok(Self::new_with_config_and_pool(pool, config))
+        let store = Self::new_with_config_and_pool(pool, config);
+
+        // Start connection monitoring
+        let store_clone = store.clone();
+        tokio::spawn(async move {
+            store_clone.monitor_connection_pool().await;
+        });
+
+        Ok(store)
     }
 
     // Enhanced event saving with priority support
@@ -176,18 +245,73 @@ impl EventStore {
             .await
             .context("Failed to receive response from batch processor")?
     }
-    // Enhanced event saving with backpressure control
+
+    // Modify the with_retry method to handle lifetimes correctly
+    async fn with_retry<F, Fut, T, E>(&self, operation: F, config: &RetryConfig) -> Result<T>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<T, E>> + Send,
+        T: Send,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let mut retries = 0;
+        let mut delay = config.initial_delay;
+
+        loop {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if retries >= config.max_retries {
+                        return Err(anyhow::anyhow!(
+                            "Operation failed after {} retries: {}",
+                            retries,
+                            e
+                        ));
+                    }
+
+                    warn!(
+                        "Operation failed (attempt {}/{}): {}. Retrying in {:?}...",
+                        retries + 1,
+                        config.max_retries,
+                        e,
+                        delay
+                    );
+
+                    tokio::time::sleep(delay).await;
+                    retries += 1;
+                    delay = std::cmp::min(
+                        Duration::from_secs_f64(delay.as_secs_f64() * config.backoff_factor),
+                        config.max_delay,
+                    );
+                }
+            }
+        }
+    }
+
+    // Modify save_events to handle the move issue correctly
     pub async fn save_events(
         &self,
         aggregate_id: Uuid,
         events: Vec<AccountEvent>,
         expected_version: i64,
     ) -> Result<()> {
-        self.save_events_with_priority(
-            aggregate_id,
-            events,
-            expected_version,
-            EventPriority::Normal,
+        let config = RetryConfig::default();
+        let events = events.clone(); // Clone events before moving into the closure
+
+        self.with_retry(
+            move || {
+                let events = events.clone(); // Clone again inside the closure
+                async move {
+                    self.save_events_with_priority(
+                        aggregate_id,
+                        events,
+                        expected_version,
+                        EventPriority::Normal,
+                    )
+                    .await
+                }
+            },
+            &config,
         )
         .await
     }
@@ -203,6 +327,8 @@ impl EventStore {
     ) {
         let batch_size = config.batch_size;
         let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
+        let mut retry_queue: Vec<RetryEvent> = Vec::new();
+        let mut retry_interval = tokio::time::interval(Duration::from_secs(1));
 
         let mut priority_batches: HashMap<EventPriority, Vec<BatchedEvent>> = HashMap::new();
         let mut last_flush = Instant::now();
@@ -210,59 +336,87 @@ impl EventStore {
         debug!("Starting batch processor worker {}", worker_id);
 
         loop {
-            // Try to receive with a timeout to ensure periodic flushing
-            let event = {
-                let mut rx = receiver.lock().await;
-                // Use try_recv to avoid blocking when checking for timeouts
-                match rx.try_recv() {
-                    Ok(event) => Some(event),
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        // No immediate message, but check if we should flush due to timeout
-                        drop(rx);
-
-                        if !priority_batches.is_empty() && last_flush.elapsed() >= batch_timeout {
-                            None // Signal to flush without new event
-                        } else {
-                            // Wait a bit and try again
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                            continue;
+            tokio::select! {
+                // Process retries
+                _ = retry_interval.tick() => {
+                    if !retry_queue.is_empty() {
+                        let retry_batch = std::mem::replace(&mut retry_queue, Vec::new());
+                        for retry_event in retry_batch {
+                            let (response_tx, _) = tokio::sync::oneshot::channel();
+                            let batched_event = BatchedEvent {
+                                aggregate_id: retry_event.aggregate_id,
+                                events: retry_event.events,
+                                expected_version: retry_event.expected_version,
+                                response_tx,
+                                created_at: retry_event.created_at,
+                                priority: retry_event.priority,
+                            };
+                            priority_batches
+                                .entry(batched_event.priority)
+                                .or_insert_with(Vec::new)
+                                .push(batched_event);
                         }
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!("Worker {} shutting down - channel closed", worker_id);
-                        break;
+                }
+                // Process new events
+                event = async {
+                    let mut rx = receiver.lock().await;
+                    match rx.try_recv() {
+                        Ok(event) => Some(event),
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            if !priority_batches.is_empty() && last_flush.elapsed() >= batch_timeout {
+                                None
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                None
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            debug!("Worker {} shutting down - channel closed", worker_id);
+                            None
+                        }
+                    }
+                } => {
+                    if let Some(event) = event {
+                        priority_batches
+                            .entry(event.priority)
+                            .or_insert_with(Vec::new)
+                            .push(event);
                     }
                 }
-            };
-
-            // Add event to appropriate priority batch if we received one
-            if let Some(event) = event {
-                priority_batches
-                    .entry(event.priority)
-                    .or_insert_with(Vec::new)
-                    .push(event);
             }
 
             let total_events: usize = priority_batches.values().map(|v| v.len()).sum();
 
-            // Flush conditions: size limit, timeout, or critical events present
+            // Enhanced flush conditions
             let should_flush = total_events >= batch_size
                 || last_flush.elapsed() >= batch_timeout
                 || priority_batches.contains_key(&EventPriority::Critical)
                 || priority_batches
                     .values()
                     .flatten()
-                    .any(|e| e.created_at.elapsed() >= batch_timeout);
+                    .any(|e| e.created_at.elapsed() >= batch_timeout * 2);
 
             if should_flush && !priority_batches.is_empty() {
-                // Process batches by priority (highest first)
                 let mut priorities: Vec<_> = priority_batches.keys().copied().collect();
-                priorities.sort_by(|a, b| b.cmp(a)); // Descending order
+                priorities.sort_by(|a, b| b.cmp(a));
 
                 for priority in priorities {
                     if let Some(batch) = priority_batches.remove(&priority) {
                         if !batch.is_empty() {
                             let batch_count = batch.len();
+                            // Create retry events before processing the batch
+                            let retry_events: Vec<_> = batch
+                                .iter()
+                                .map(|b| RetryEvent {
+                                    aggregate_id: b.aggregate_id,
+                                    events: b.events.clone(),
+                                    expected_version: b.expected_version,
+                                    created_at: b.created_at,
+                                    priority: b.priority,
+                                })
+                                .collect();
+
                             match Self::flush_batch(&pool, batch).await {
                                 Ok(()) => {
                                     metrics
@@ -279,6 +433,9 @@ impl EventStore {
                                         .events_failed
                                         .fetch_add(batch_count as u64, Ordering::Relaxed);
                                     error!("Worker {} failed to process batch: {}", worker_id, e);
+
+                                    // Add all retry events to the queue
+                                    retry_queue.extend(retry_events);
                                 }
                             }
                             semaphore.add_permits(batch_count);
@@ -287,15 +444,6 @@ impl EventStore {
                 }
 
                 last_flush = Instant::now();
-            }
-        }
-
-        // Flush remaining events on shutdown
-        for (_, batch) in priority_batches {
-            if !batch.is_empty() {
-                let batch_count = batch.len();
-                let _ = Self::flush_batch(&pool, batch).await;
-                semaphore.add_permits(batch_count);
             }
         }
     }
@@ -409,23 +557,32 @@ impl EventStore {
             entry.1 = entry.1.max(event.version);
         }
 
-        // Version conflict check with single query
+        // Optimized version conflict check with a single query
         if !aggregates.is_empty() {
             let aggregate_ids: Vec<Uuid> = aggregates.keys().copied().collect();
             let current_versions = sqlx::query(
-            "SELECT aggregate_id, MAX(version) as max_version FROM events WHERE aggregate_id = ANY($1) GROUP BY aggregate_id"
-        )
-        .bind(&aggregate_ids)
-        .fetch_all(&mut **tx)
-        .await
-        .context("Failed to check current versions")?;
+                r#"
+                WITH latest_versions AS (
+                    SELECT DISTINCT ON (aggregate_id) 
+                        aggregate_id, 
+                        version
+                    FROM events 
+                    WHERE aggregate_id = ANY($1)
+                    ORDER BY aggregate_id, version DESC
+                )
+                SELECT aggregate_id, version FROM latest_versions
+                "#,
+            )
+            .bind(&aggregate_ids)
+            .fetch_all(&mut **tx)
+            .await
+            .context("Failed to check current versions")?;
 
             for row in current_versions {
                 let aggregate_id: Uuid = row.get("aggregate_id");
-                let current_version: Option<i64> = row.get("max_version");
+                let current_version: i64 = row.get("version");
 
                 if let Some((min_version, _)) = aggregates.get(&aggregate_id) {
-                    let current_version = current_version.unwrap_or(0);
                     if current_version >= *min_version {
                         return Err(anyhow::anyhow!(
                             "Version conflict for aggregate {}: expected {}, found {}",
@@ -438,30 +595,49 @@ impl EventStore {
             }
         }
 
-        // Use COPY for bulk insert - Fixed CSV formatting
+        // Use COPY with optimized buffer size
         let mut copy_writer = tx
-        .copy_in_raw(
-            "COPY events (id, aggregate_id, event_type, event_data, version, timestamp) FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\"')"
-        )
-        .await
-        .context("Failed to start COPY operation")?;
+            .copy_in_raw(
+                "COPY events (id, aggregate_id, event_type, event_data, version, timestamp) FROM STDIN WITH (FORMAT CSV, QUOTE '\"', ESCAPE '\"', BUFFER_SIZE 1048576)"
+            )
+            .await
+            .context("Failed to start COPY operation")?;
+
+        // Pre-allocate buffer for better performance
+        let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB buffer
 
         for event in event_data {
-            // Properly escape CSV values
+            // Optimize CSV formatting
             let event_data_str = event.event_data.to_string();
             let escaped_data = event_data_str.replace("\"", "\"\"");
 
-            let csv_line = format!(
-                "{},{},{},\"{}\",{},{}\n",
-                event.id,
-                event.aggregate_id,
-                event.event_type,
-                escaped_data,
-                event.version,
-                event.timestamp.format("%Y-%m-%d %H:%M:%S%.6f UTC")
+            buffer.extend_from_slice(
+                format!(
+                    "{},{},{},\"{}\",{},{}\n",
+                    event.id,
+                    event.aggregate_id,
+                    event.event_type,
+                    escaped_data,
+                    event.version,
+                    event.timestamp.format("%Y-%m-%d %H:%M:%S%.6f UTC")
+                )
+                .as_bytes(),
             );
+
+            // Flush buffer when it gets large
+            if buffer.len() >= 1024 * 1024 {
+                copy_writer
+                    .send(buffer.as_slice())
+                    .await
+                    .context("Failed to send data to COPY")?;
+                buffer.clear();
+            }
+        }
+
+        // Send remaining data
+        if !buffer.is_empty() {
             copy_writer
-                .send(csv_line.as_bytes())
+                .send(buffer.as_slice())
                 .await
                 .context("Failed to send data to COPY")?;
         }
@@ -510,92 +686,103 @@ impl EventStore {
         Ok(())
     }
 
-    // Enhanced event retrieval with better caching
-    // Optimized event retrieval with better caching and batching
+    // Modify get_events to add proper type annotations
     pub async fn get_events(
         &self,
         aggregate_id: Uuid,
         from_version: Option<i64>,
     ) -> Result<Vec<Event>> {
-        // Check cache first
-        let snapshot = {
-            let cache = self.snapshot_cache.read().await;
-            let cached = cache
-                .get(&aggregate_id)
-                .filter(|s| s.created_at.elapsed() < s.ttl)
-                .cloned();
+        let config = RetryConfig::default();
+        let store = self.clone();
 
-            if cached.is_some() {
-                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
-            }
+        self.with_retry(
+            move || {
+                let store = store.clone();
+                async move {
+                    // Check cache first
+                    let snapshot = {
+                        let cache = store.snapshot_cache.read().await;
+                        let cached = cache
+                            .get(&aggregate_id)
+                            .filter(|s| s.created_at.elapsed() < s.ttl)
+                            .cloned();
 
-            cached
-        };
+                        if cached.is_some() {
+                            store.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            store.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+                        }
 
-        let (start_version, mut events) = if let Some(snapshot) = &snapshot {
-            if let Some(from_ver) = from_version {
-                if from_ver <= snapshot.version {
-                    (
-                        Some(snapshot.version),
-                        vec![self.create_snapshot_event(snapshot)],
-                    )
-                } else {
-                    (from_version, vec![])
+                        cached
+                    };
+
+                    let (start_version, mut events) = if let Some(snapshot) = &snapshot {
+                        if let Some(from_ver) = from_version {
+                            if from_ver <= snapshot.version {
+                                (
+                                    Some(snapshot.version),
+                                    vec![store.create_snapshot_event(snapshot)],
+                                )
+                            } else {
+                                (from_version, vec![])
+                            }
+                        } else {
+                            (
+                                Some(snapshot.version),
+                                vec![store.create_snapshot_event(snapshot)],
+                            )
+                        }
+                    } else {
+                        (from_version, vec![])
+                    };
+
+                    // Fetch events with prepared statement
+                    let db_events = if let Some(version) = start_version {
+                        sqlx::query_as!(
+                            EventRow,
+                            r#"
+                            SELECT id, aggregate_id, event_type, event_data, version, timestamp
+                            FROM events
+                            WHERE aggregate_id = $1 AND version > $2
+                            ORDER BY version
+                            "#,
+                            aggregate_id,
+                            version
+                        )
+                        .fetch_all(&store.pool)
+                        .await
+                        .context("Failed to fetch events from database")?
+                    } else {
+                        sqlx::query_as!(
+                            EventRow,
+                            r#"
+                            SELECT id, aggregate_id, event_type, event_data, version, timestamp
+                            FROM events
+                            WHERE aggregate_id = $1
+                            ORDER BY version
+                            "#,
+                            aggregate_id
+                        )
+                        .fetch_all(&store.pool)
+                        .await
+                        .context("Failed to fetch events from database")?
+                    };
+
+                    events.extend(db_events.into_iter().map(|row| Event {
+                        id: row.id,
+                        aggregate_id: row.aggregate_id,
+                        event_type: row.event_type,
+                        event_data: row.event_data,
+                        version: row.version,
+                        timestamp: row.timestamp,
+                    }));
+
+                    Ok::<Vec<Event>, anyhow::Error>(events)
                 }
-            } else {
-                (
-                    Some(snapshot.version),
-                    vec![self.create_snapshot_event(snapshot)],
-                )
-            }
-        } else {
-            (from_version, vec![])
-        };
-
-        // Fetch events with prepared statement
-        let db_events = if let Some(version) = start_version {
-            sqlx::query_as!(
-                EventRow,
-                r#"
-                SELECT id, aggregate_id, event_type, event_data, version, timestamp
-                FROM events
-                WHERE aggregate_id = $1 AND version > $2
-                ORDER BY version
-                "#,
-                aggregate_id,
-                version
-            )
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to fetch events from database")?
-        } else {
-            sqlx::query_as!(
-                EventRow,
-                r#"
-                SELECT id, aggregate_id, event_type, event_data, version, timestamp
-                FROM events
-                WHERE aggregate_id = $1
-                ORDER BY version
-                "#,
-                aggregate_id
-            )
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to fetch events from database")?
-        };
-
-        events.extend(db_events.into_iter().map(|row| Event {
-            id: row.id,
-            aggregate_id: row.aggregate_id,
-            event_type: row.event_type,
-            event_data: row.event_data,
-            version: row.version,
-            timestamp: row.timestamp,
-        }));
-
-        Ok(events)
+            },
+            &config,
+        )
+        .await
     }
 
     fn create_snapshot_event(&self, snapshot: &CachedSnapshot) -> Event {
@@ -823,13 +1010,52 @@ impl EventStore {
     }
 
     pub fn get_metrics(&self) -> EventStoreMetrics {
+        let processed = self.metrics.events_processed.load(Ordering::Relaxed);
+        let failed = self.metrics.events_failed.load(Ordering::Relaxed);
+        let batches = self.metrics.batch_count.load(Ordering::Relaxed);
+        let cache_hits = self.metrics.cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.metrics.cache_misses.load(Ordering::Relaxed);
+
+        let success_rate = if processed > 0 {
+            ((processed - failed) as f64 / processed as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let cache_hit_rate = if cache_hits + cache_misses > 0 {
+            (cache_hits as f64 / (cache_hits + cache_misses) as f64) * 100.0
+        } else {
+            0.0
+        };
+
         EventStoreMetrics {
-            events_processed: AtomicU64::new(self.metrics.events_processed.load(Ordering::Relaxed)),
-            events_failed: AtomicU64::new(self.metrics.events_failed.load(Ordering::Relaxed)),
-            batch_count: AtomicU64::new(self.metrics.batch_count.load(Ordering::Relaxed)),
+            events_processed: AtomicU64::new(processed),
+            events_failed: AtomicU64::new(failed),
+            batch_count: AtomicU64::new(batches),
             avg_batch_size: AtomicU64::new(self.metrics.avg_batch_size.load(Ordering::Relaxed)),
-            cache_hits: AtomicU64::new(self.metrics.cache_hits.load(Ordering::Relaxed)),
-            cache_misses: AtomicU64::new(self.metrics.cache_misses.load(Ordering::Relaxed)),
+            cache_hits: AtomicU64::new(cache_hits),
+            cache_misses: AtomicU64::new(cache_misses),
+            success_rate,
+            cache_hit_rate,
+            connection_acquire_time: AtomicU64::new(
+                self.metrics.connection_acquire_time.load(Ordering::Relaxed),
+            ),
+            connection_acquire_errors: AtomicU64::new(
+                self.metrics
+                    .connection_acquire_errors
+                    .load(Ordering::Relaxed),
+            ),
+            connection_reuse_count: AtomicU64::new(
+                self.metrics.connection_reuse_count.load(Ordering::Relaxed),
+            ),
+            connection_timeout_count: AtomicU64::new(
+                self.metrics
+                    .connection_timeout_count
+                    .load(Ordering::Relaxed),
+            ),
+            connection_lifetime: AtomicU64::new(
+                self.metrics.connection_lifetime.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -837,17 +1063,56 @@ impl EventStore {
         (self.pool.size(), self.pool.num_idle() as u32)
     }
 
+    /// Health check with detailed diagnostics
     pub async fn health_check(&self) -> Result<EventStoreHealth> {
         let (total_connections, idle_connections) = self.pool_stats();
+        let start_time = Instant::now();
 
-        let db_status = match sqlx::query("SELECT 1").fetch_one(&self.pool).await {
-            Ok(_) => "healthy".to_string(),
+        // Check database connection and get detailed metrics
+        let db_status = match sqlx::query(
+            r#"
+            SELECT 
+                count(*) as active_connections,
+                sum(case when state = 'idle' then 1 else 0 end) as idle_connections,
+                sum(case when state = 'active' then 1 else 0 end) as active_queries,
+                sum(case when state = 'idle in transaction' then 1 else 0 end) as idle_transactions
+            FROM pg_stat_activity 
+            WHERE datname = current_database()
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(row) => {
+                let active_connections: i64 = row.get("active_connections");
+                let idle_connections: i64 = row.get("idle_connections");
+                let active_queries: i64 = row.get("active_queries");
+                let idle_transactions: i64 = row.get("idle_transactions");
+
+                format!(
+                    "healthy (active: {}, idle: {}, queries: {}, idle_tx: {})",
+                    active_connections, idle_connections, active_queries, idle_transactions
+                )
+            }
             Err(e) => format!("unhealthy: {}", e),
         };
 
         let cache_size = {
             let cache = self.snapshot_cache.read().await;
             cache.len()
+        };
+
+        // Calculate batch queue metrics
+        let batch_queue_metrics = {
+            let available_permits = self.batch_semaphore.available_permits();
+            let total_permits = self.config.max_batch_queue_size;
+            let used_permits = total_permits - available_permits;
+            let queue_utilization = (used_permits as f64 / total_permits as f64) * 100.0;
+
+            format!(
+                "Queue: {}/{} permits used ({:.1}% utilization)",
+                used_permits, total_permits, queue_utilization
+            )
         };
 
         Ok(EventStoreHealth {
@@ -857,7 +1122,33 @@ impl EventStore {
             cache_size,
             batch_queue_permits: self.batch_semaphore.available_permits(),
             metrics: self.get_metrics(),
+            batch_queue_metrics,
+            health_check_duration: start_time.elapsed(),
         })
+    }
+
+    // Add this method to monitor connection pool
+    async fn monitor_connection_pool(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let pool_stats = self.pool_stats();
+            let metrics = self.get_metrics();
+
+            info!(
+                "Connection Pool Stats - Total: {}, Idle: {}, Active: {}, Acquire Time: {}ms, Errors: {}, Reuse: {}, Timeouts: {}, Avg Lifetime: {}s",
+                pool_stats.0,
+                pool_stats.1,
+                pool_stats.0 - pool_stats.1,
+                metrics.connection_acquire_time.load(Ordering::Relaxed),
+                metrics.connection_acquire_errors.load(Ordering::Relaxed),
+                metrics.connection_reuse_count.load(Ordering::Relaxed),
+                metrics.connection_timeout_count.load(Ordering::Relaxed),
+                metrics.connection_lifetime.load(Ordering::Relaxed) / 1000
+            );
+        }
     }
 }
 /// Health check response
@@ -869,6 +1160,8 @@ pub struct EventStoreHealth {
     pub cache_size: usize,
     pub batch_queue_permits: usize,
     pub metrics: EventStoreMetrics,
+    pub batch_queue_metrics: String,
+    pub health_check_duration: Duration,
 }
 // Helper structs
 #[derive(Debug)]
@@ -917,20 +1210,22 @@ impl Default for EventStoreConfig {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgresql://postgres:password@localhost:5432/banking_es".to_string()
             }),
-            max_connections: 10,
-            min_connections: 1,
+            // Optimized connection pool settings
+            max_connections: 100, // Increased for better concurrency
+            min_connections: 20,  // Increased to maintain a healthy pool
             acquire_timeout_secs: 30,
             idle_timeout_secs: 600,
             max_lifetime_secs: 1800,
 
-            batch_size: 1000,
-            batch_timeout_ms: 10,
-            max_batch_queue_size: 10000,
-            batch_processor_count: 4,
-            snapshot_threshold: 100,
-            snapshot_interval_secs: 60,
-            snapshot_cache_ttl_secs: 3600, // 1 hour
-            max_snapshots_per_run: 100,
+            // Optimized batching settings
+            batch_size: 5000,
+            batch_timeout_ms: 5,
+            max_batch_queue_size: 50000,
+            batch_processor_count: 8,
+            snapshot_threshold: 1000,
+            snapshot_interval_secs: 300,
+            snapshot_cache_ttl_secs: 3600,
+            max_snapshots_per_run: 500,
         }
     }
 }

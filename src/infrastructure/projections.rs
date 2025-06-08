@@ -8,7 +8,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// Enhanced error types for projections
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectionError {
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] sqlx::Error),
+    #[error("Cache error: {0}")]
+    CacheError(String),
+    #[error("Batch processing error: {0}")]
+    BatchError(String),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+}
+
+// Projection metrics
+#[derive(Debug, Default)]
+struct ProjectionMetrics {
+    cache_hits: std::sync::atomic::AtomicU64,
+    cache_misses: std::sync::atomic::AtomicU64,
+    batch_updates: std::sync::atomic::AtomicU64,
+    events_processed: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+    query_duration: std::sync::atomic::AtomicU64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountProjection {
@@ -34,6 +59,7 @@ struct CacheEntry<T> {
     data: T,
     last_accessed: Instant,
     version: u64,
+    ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -43,6 +69,35 @@ pub struct ProjectionStore {
     transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
     update_sender: mpsc::UnboundedSender<ProjectionUpdate>,
     cache_version: Arc<std::sync::atomic::AtomicU64>,
+    metrics: Arc<ProjectionMetrics>,
+    config: ProjectionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectionConfig {
+    pub cache_ttl_secs: u64,
+    pub batch_size: usize,
+    pub batch_timeout_ms: u64,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+}
+
+impl Default for ProjectionConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl_secs: 300, // 5 minutes
+            batch_size: 5000,
+            batch_timeout_ms: 20,
+            max_connections: 100,
+            min_connections: 20,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -57,6 +112,8 @@ impl ProjectionStore {
         let account_cache = Arc::new(RwLock::new(HashMap::new()));
         let transaction_cache = Arc::new(RwLock::new(HashMap::new()));
         let cache_version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let metrics = Arc::new(ProjectionMetrics::default());
+        let config = ProjectionConfig::default();
 
         let store = Self {
             pool: pool.clone(),
@@ -64,6 +121,8 @@ impl ProjectionStore {
             transaction_cache: transaction_cache.clone(),
             update_sender,
             cache_version: cache_version.clone(),
+            metrics: metrics.clone(),
+            config: config.clone(),
         };
 
         // Start background batch processor
@@ -73,6 +132,8 @@ impl ProjectionStore {
             account_cache.clone(),
             transaction_cache.clone(),
             cache_version,
+            metrics.clone(),
+            config,
         ));
 
         // Start cache cleanup worker
@@ -81,33 +142,51 @@ impl ProjectionStore {
             transaction_cache.clone(),
         ));
 
+        // Start metrics reporter
+        tokio::spawn(Self::metrics_reporter(metrics));
+
         store
     }
-    /// Create EventStore with a specific pool size
-    pub async fn new_with_pool_size(pool_size: u32) -> Result<Self> {
+
+    pub async fn new_with_config(config: ProjectionConfig) -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL environment variable is required"))?;
 
-        Self::new_with_pool_size_and_url(pool_size, &database_url).await
-    }
-
-    /// Create EventStore with a specific pool size and database URL
-    pub async fn new_with_pool_size_and_url(pool_size: u32, database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(pool_size)
-            .min_connections(1)
-            .acquire_timeout(Duration::from_secs(30))
-            .idle_timeout(Duration::from_secs(600))
-            .max_lifetime(Duration::from_secs(1800))
-            .connect(database_url)
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // Set session-level optimizations
+                    sqlx::query(
+                        r#"
+                        SET SESSION synchronous_commit = 'off';
+                        SET SESSION work_mem = '64MB';
+                        SET SESSION maintenance_work_mem = '256MB';
+                        SET SESSION effective_cache_size = '4GB';
+                        SET SESSION random_page_cost = 1.1;
+                        SET SESSION effective_io_concurrency = 200;
+                        "#,
+                    )
+                    .execute(conn)
+                    .await?;
+
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
             .await?;
 
         Ok(Self::new(pool))
     }
-    // Asynchronous projection updates with batching
+
     pub async fn upsert_accounts_batch(&self, accounts: Vec<AccountProjection>) -> Result<()> {
         self.update_sender
-            .send(ProjectionUpdate::AccountBatch(accounts))?;
+            .send(ProjectionUpdate::AccountBatch(accounts))
+            .map_err(|e| anyhow::anyhow!("Failed to send account batch: {}", e))?;
         Ok(())
     }
 
@@ -116,22 +195,32 @@ impl ProjectionStore {
         transactions: Vec<TransactionProjection>,
     ) -> Result<()> {
         self.update_sender
-            .send(ProjectionUpdate::TransactionBatch(transactions))?;
+            .send(ProjectionUpdate::TransactionBatch(transactions))
+            .map_err(|e| anyhow::anyhow!("Failed to send transaction batch: {}", e))?;
         Ok(())
     }
 
-    // High-performance cached reads
     pub async fn get_account(&self, account_id: Uuid) -> Result<Option<AccountProjection>> {
+        let start_time = Instant::now();
+
         // Try cache first
         {
             let cache = self.account_cache.read().await;
             if let Some(entry) = cache.get(&account_id) {
-                // Update access time (we'll do this periodically to avoid write locks)
-                return Ok(Some(entry.data.clone()));
+                if entry.last_accessed.elapsed() < entry.ttl {
+                    self.metrics
+                        .cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(entry.data.clone()));
+                }
             }
         }
 
-        // Cache miss - fetch from database
+        self.metrics
+            .cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Cache miss - fetch from database with prepared statement
         let account = sqlx::query_as!(
             AccountProjection,
             r#"
@@ -144,7 +233,7 @@ impl ProjectionStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        // Update cache
+        // Update cache if found
         if let Some(ref account) = account {
             let mut cache = self.account_cache.write().await;
             cache.insert(
@@ -155,9 +244,15 @@ impl ProjectionStore {
                     version: self
                         .cache_version
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    ttl: Duration::from_secs(self.config.cache_ttl_secs),
                 },
             );
         }
+
+        self.metrics.query_duration.fetch_add(
+            start_time.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(account)
     }
@@ -166,15 +261,26 @@ impl ProjectionStore {
         &self,
         account_id: Uuid,
     ) -> Result<Vec<TransactionProjection>> {
+        let start_time = Instant::now();
+
         // Try cache first
         {
             let cache = self.transaction_cache.read().await;
             if let Some(entry) = cache.get(&account_id) {
-                return Ok(entry.data.clone());
+                if entry.last_accessed.elapsed() < entry.ttl {
+                    self.metrics
+                        .cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(entry.data.clone());
+                }
             }
         }
 
-        // Cache miss - fetch from database
+        self.metrics
+            .cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Cache miss - fetch from database with prepared statement
         let transactions = sqlx::query_as!(
             TransactionProjection,
             r#"
@@ -200,16 +306,23 @@ impl ProjectionStore {
                     version: self
                         .cache_version
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    ttl: Duration::from_secs(self.config.cache_ttl_secs),
                 },
             );
         }
+
+        self.metrics.query_duration.fetch_add(
+            start_time.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(transactions)
     }
 
     pub async fn get_all_accounts(&self) -> Result<Vec<AccountProjection>> {
-        // For frequently accessed data, consider a dedicated cache
-        sqlx::query_as!(
+        let start_time = Instant::now();
+
+        let accounts = sqlx::query_as!(
             AccountProjection,
             r#"
             SELECT id, owner_name, balance, is_active, created_at, updated_at
@@ -220,24 +333,29 @@ impl ProjectionStore {
             "#
         )
         .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
+        .await?;
+
+        self.metrics.query_duration.fetch_add(
+            start_time.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(accounts)
     }
 
-    // Background batch processor
     async fn batch_update_processor(
         pool: PgPool,
         mut receiver: mpsc::UnboundedReceiver<ProjectionUpdate>,
         account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
         transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
         cache_version: Arc<std::sync::atomic::AtomicU64>,
+        metrics: Arc<ProjectionMetrics>,
+        config: ProjectionConfig,
     ) {
-        const BATCH_SIZE: usize = 5000;
-        const BATCH_TIMEOUT: Duration = Duration::from_millis(20);
-
-        let mut account_batch = Vec::new();
-        let mut transaction_batch = Vec::new();
+        let mut account_batch = Vec::with_capacity(config.batch_size);
+        let mut transaction_batch = Vec::with_capacity(config.batch_size);
         let mut last_flush = Instant::now();
+        let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
 
         while let Some(update) = receiver.recv().await {
             match update {
@@ -250,19 +368,23 @@ impl ProjectionStore {
             }
 
             // Flush if batch size reached or timeout exceeded
-            if account_batch.len() >= BATCH_SIZE
-                || transaction_batch.len() >= BATCH_SIZE
-                || last_flush.elapsed() >= BATCH_TIMEOUT
+            if account_batch.len() >= config.batch_size
+                || transaction_batch.len() >= config.batch_size
+                || last_flush.elapsed() >= batch_timeout
             {
-                Self::flush_batches(
+                if let Err(e) = Self::flush_batches(
                     &pool,
                     &mut account_batch,
                     &mut transaction_batch,
                     &account_cache,
                     &transaction_cache,
                     &cache_version,
+                    &metrics,
                 )
-                .await;
+                .await
+                {
+                    error!("Failed to flush batches: {}", e);
+                }
 
                 last_flush = Instant::now();
             }
@@ -276,21 +398,15 @@ impl ProjectionStore {
         account_cache: &Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
         transaction_cache: &Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
         cache_version: &Arc<std::sync::atomic::AtomicU64>,
-    ) {
-        let mut tx = match pool.begin().await {
-            Ok(tx) => tx,
-            Err(e) => {
-                eprintln!("Failed to start transaction: {}", e);
-                return;
-            }
-        };
+        metrics: &Arc<ProjectionMetrics>,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
 
         // Process account updates
         if !account_batch.is_empty() {
             if let Err(e) = Self::bulk_upsert_accounts(&mut tx, account_batch).await {
-                eprintln!("Failed to upsert accounts: {}", e);
                 let _ = tx.rollback().await;
-                return;
+                return Err(e.into());
             }
 
             // Update cache
@@ -304,18 +420,22 @@ impl ProjectionStore {
                             data: account,
                             last_accessed: Instant::now(),
                             version,
+                            ttl: Duration::from_secs(300), // 5 minutes TTL
                         },
                     );
                 }
             }
+
+            metrics
+                .batch_updates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Process transaction updates
         if !transaction_batch.is_empty() {
             if let Err(e) = Self::bulk_insert_transactions(&mut tx, transaction_batch).await {
-                eprintln!("Failed to insert transactions: {}", e);
                 let _ = tx.rollback().await;
-                return;
+                return Err(e.into());
             }
 
             // Invalidate transaction cache for affected accounts
@@ -325,11 +445,14 @@ impl ProjectionStore {
                     cache.remove(&transaction.account_id);
                 }
             }
+
+            metrics
+                .batch_updates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Err(e) = tx.commit().await {
-            eprintln!("Failed to commit transaction: {}", e);
-        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn bulk_upsert_accounts(
@@ -364,8 +487,8 @@ impl ProjectionStore {
             &created_ats,
             &updated_ats
         )
-            .execute(&mut **tx)
-            .await?;
+        .execute(&mut **tx)
+        .await?;
 
         Ok(())
     }
@@ -399,13 +522,12 @@ impl ProjectionStore {
             &amounts,
             &timestamps
         )
-            .execute(&mut **tx)
-            .await?;
+        .execute(&mut **tx)
+        .await?;
 
         Ok(())
     }
 
-    // Cache cleanup worker
     async fn cache_cleanup_worker(
         account_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<AccountProjection>>>>,
         transaction_cache: Arc<RwLock<HashMap<Uuid, CacheEntry<Vec<TransactionProjection>>>>>,
@@ -428,6 +550,40 @@ impl ProjectionStore {
                 let mut cache = transaction_cache.write().await;
                 cache.retain(|_, entry| entry.last_accessed > cutoff);
             }
+        }
+    }
+
+    async fn metrics_reporter(metrics: Arc<ProjectionMetrics>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let hits = metrics
+                .cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let misses = metrics
+                .cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let batches = metrics
+                .batch_updates
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let errors = metrics.errors.load(std::sync::atomic::Ordering::Relaxed);
+            let avg_query_time = metrics
+                .query_duration
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1000.0; // Convert to milliseconds
+
+            let hit_rate = if hits + misses > 0 {
+                (hits as f64 / (hits + misses) as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            info!(
+                "Projection Metrics - Cache Hit Rate: {:.1}%, Batch Updates: {}, Errors: {}, Avg Query Time: {:.2}ms",
+                hit_rate, batches, errors, avg_query_time
+            );
         }
     }
 }

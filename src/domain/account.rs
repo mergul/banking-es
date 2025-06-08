@@ -30,6 +30,8 @@ pub enum AccountError {
     EventDeserializationError(String),
     #[error("Infrastructure error: {0}")]
     InfrastructureError(String),
+    #[error("Version conflict: expected {expected}, found {actual}")]
+    VersionConflict { expected: i64, actual: i64 },
 }
 
 impl Account {
