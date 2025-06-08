@@ -32,6 +32,7 @@ tower-http = { version = "0.5", features = ["cors"] }
 rust_decimal = { version = "1.37.1", features = ["serde"] }
 bigdecimal = {version = "0.4", features = ["serde"] }
 async-trait = "0.1"
+redis = { version = "0.23", features = ["tokio-comp"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

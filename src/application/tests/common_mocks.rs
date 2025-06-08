@@ -15,3 +15,17 @@ mock! {
         async fn get_by_id(&self, id: Uuid) -> Result<Option<Account>, AccountError>;
     }
 }
+
+// Add MockCacheService
+use crate::infrastructure::cache::CacheService; // Add this
+use serde::{de::DeserializeOwned, Serialize};    // Add these for CacheService methods
+
+mock! {
+    pub CacheService {} // Mock struct name
+    #[async_trait]
+    impl CacheService for CacheService {
+        async fn get<T: DeserializeOwned + Send>(&self, key: &str) -> anyhow::Result<Option<T>>;
+        async fn set<T: Serialize + Send + Sync>(&self, key: &str, value: &T, expiration_secs: Option<usize>) -> anyhow::Result<()>;
+        async fn delete(&self, key: &str) -> anyhow::Result<()>;
+    }
+}
