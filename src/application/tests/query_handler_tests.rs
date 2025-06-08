@@ -162,14 +162,27 @@ async fn test_get_account_balance_success() {
         version: 1,
     };
     let cloned_account_for_repo = account.clone();
-    let cloned_account_for_cache_set = account.clone();
+    // let cloned_account_for_cache_set = account.clone(); // Not needed directly if set uses _
 
     // Cache miss
-    mock_cache.expect_get::<Account>().times(1).returning(|_| Ok(None));
+    mock_cache.expect_get::<Account>()
+        .with(eq(format!("account:{}", account_id)))
+        .times(1)
+        .returning(|_| Ok(None));
     // Repo hit
-    mock_repo.expect_get_by_id().times(1).returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
+    mock_repo.expect_get_by_id()
+        .with(eq(account_id))
+        .times(1)
+        .returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
     // Cache set
-    mock_cache.expect_set::<Account>().times(1).returning(|_,_,_| Ok(()));
+    mock_cache.expect_set::<Account>()
+        .withf(move |key, acc_val, exp| {
+            key == format!("account:{}", account_id) &&
+            acc_val.id == account.id && // Use original account for comparison
+            exp.is_some() && exp.unwrap() == 3600
+        })
+        .times(1)
+        .returning(|_,_,_| Ok(()));
 
 
     let query_handler = AccountQueryHandler::new(Arc::new(mock_repo), Arc::new(mock_cache));
@@ -222,7 +235,14 @@ async fn test_is_account_active_success_active() {
     // Repo hit
     mock_repo.expect_get_by_id().times(1).returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
     // Cache set
-    mock_cache.expect_set::<Account>().times(1).returning(|_,_,_| Ok(()));
+    mock_cache.expect_set::<Account>()
+        .withf(move |key, acc_val, exp| {
+            key == format!("account:{}", account_id) &&
+            acc_val.id == account.id &&
+            exp.is_some() && exp.unwrap() == 3600
+        })
+        .times(1)
+        .returning(|_,_,_| Ok(()));
 
     let query_handler = AccountQueryHandler::new(Arc::new(mock_repo), Arc::new(mock_cache));
     let result = query_handler.is_account_active(account_id).await;
@@ -250,7 +270,14 @@ async fn test_is_account_active_success_inactive() {
     // Repo hit
     mock_repo.expect_get_by_id().times(1).returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
     // Cache set
-    mock_cache.expect_set::<Account>().times(1).returning(|_,_,_| Ok(()));
+    mock_cache.expect_set::<Account>()
+        .withf(move |key, acc_val, exp| {
+            key == format!("account:{}", account_id) &&
+            acc_val.id == account.id &&
+            exp.is_some() && exp.unwrap() == 3600
+        })
+        .times(1)
+        .returning(|_,_,_| Ok(()));
 
 
     let query_handler = AccountQueryHandler::new(Arc::new(mock_repo), Arc::new(mock_cache));
@@ -281,4 +308,88 @@ async fn test_is_account_active_not_found() {
         AccountError::NotFound => {}
         e => panic!("Expected AccountError::NotFound, got {:?}", e),
     }
+}
+
+// --- Appended new test cases ---
+
+#[tokio::test]
+async fn test_get_account_by_id_cache_get_error() {
+    let account_id = Uuid::new_v4();
+    let mut mock_repo_instance = MockAccountRepository::new();
+    let mut mock_cache_instance = MockCacheService::new();
+
+    let expected_account = Account::new(account_id, "Cache Get Error User".to_string(), Decimal::new(300, 0)).unwrap();
+    let cloned_account_for_repo = expected_account.clone();
+    let cloned_account_for_cache_set = expected_account.clone();
+
+    // Expect cache get to fail
+    mock_cache_instance.expect_get::<Account>()
+        .with(eq(format!("account:{}", account_id)))
+        .times(1)
+        .returning(|_| Err(anyhow::anyhow!("Simulated cache GET error")));
+
+    // Expect repo call as fallback
+    mock_repo_instance.expect_get_by_id()
+        .with(eq(account_id))
+        .times(1)
+        .returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
+
+    // Expect cache set to still be attempted
+    mock_cache_instance.expect_set::<Account>()
+        .withf(move |key, account_val, expiration| {
+            key == format!("account:{}", account_id) &&
+            account_val.id == cloned_account_for_cache_set.id &&
+            expiration.is_some() && expiration.unwrap() == 3600
+        })
+        .times(1)
+        .returning(|_, _, _| Ok(())); // Assume set succeeds for this test case
+
+    let query_handler = AccountQueryHandler::new(Arc::new(mock_repo_instance), Arc::new(mock_cache_instance));
+    let result = query_handler.get_account_by_id(account_id).await;
+
+    assert!(result.is_ok());
+    let retrieved_account = result.unwrap();
+    assert!(retrieved_account.is_some());
+    assert_eq!(retrieved_account.unwrap().id, expected_account.id);
+}
+
+#[tokio::test]
+async fn test_get_account_by_id_cache_set_error() {
+    let account_id = Uuid::new_v4();
+    let mut mock_repo_instance = MockAccountRepository::new();
+    let mut mock_cache_instance = MockCacheService::new();
+
+    let expected_account = Account::new(account_id, "Cache Set Error User".to_string(), Decimal::new(400, 0)).unwrap();
+    let cloned_account_for_repo = expected_account.clone();
+    // Not cloning for cache_set_val as it's not used in assertion if set fails, but key and expiration are.
+
+    // Expect cache miss
+    mock_cache_instance.expect_get::<Account>()
+        .with(eq(format!("account:{}", account_id)))
+        .times(1)
+        .returning(|_| Ok(None));
+
+    // Expect repo call
+    mock_repo_instance.expect_get_by_id()
+        .with(eq(account_id))
+        .times(1)
+        .returning(move |_| Ok(Some(cloned_account_for_repo.clone())));
+
+    // Expect cache set to fail
+    mock_cache_instance.expect_set::<Account>()
+        .withf(move |key, _account_val, expiration| { // _account_val to ignore it
+            key == format!("account:{}", account_id) &&
+            expiration.is_some() && expiration.unwrap() == 3600
+        })
+        .times(1)
+        .returning(|_, _, _| Err(anyhow::anyhow!("Simulated cache SET error")));
+
+    let query_handler = AccountQueryHandler::new(Arc::new(mock_repo_instance), Arc::new(mock_cache_instance));
+    let result = query_handler.get_account_by_id(account_id).await;
+
+    // Operation should still succeed, returning data from repository
+    assert!(result.is_ok());
+    let retrieved_account = result.unwrap();
+    assert!(retrieved_account.is_some());
+    assert_eq!(retrieved_account.unwrap().id, expected_account.id);
 }
